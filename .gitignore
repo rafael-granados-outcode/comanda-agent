@@ -1,0 +1,14 @@
+# Dependencias
+node_modules/
+
+# Credenciales (usar .env.example como plantilla)
+.env
+
+# Tickets generados por la impresora falsa
+tickets/
+
+# Logs y archivos del sistema
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
