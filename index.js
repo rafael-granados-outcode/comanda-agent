@@ -1,8 +1,11 @@
-// Agente de comandas: Shopify -> impresora térmica de caja/cocina (ESC/POS por red, puerto 9100)
+// Agente de comandas: Shopify -> impresoras térmicas ESC/POS (cocina por red, puerto 9100; caja por USB)
 // Corre en el PC de la caja. No necesita servidor público ni webhooks.
 import 'dotenv/config';
 import net from 'node:net';
 import { execFile } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import notifier from 'node-notifier';
 import { fileURLToPath } from 'node:url';
 
@@ -12,12 +15,13 @@ const {
   SHOPIFY_CLIENT_SECRET,
   SHOPIFY_TOKEN,              // opcional: token fijo shpat_ (apps heredadas del admin)
   API_VERSION = '2026-07',
-  PRINTER_HOST,               // IP de la impresora térmica, ej. 192.168.1.50
+  PRINTER_HOST,               // impresora de red (cocina): IP, ej. 192.168.1.50. Vacío = no se usa
   PRINTER_PORT = '9100',
+  PRINTER_USB,                // impresora USB (caja): nombre exacto en Windows, ej. POS-80. Vacío = no se usa
   POLL_SECONDS = '15',
   PRINTED_TAG = 'comanda-impresa',
   ORDER_FILTER = 'financial_status:paid',
-  COPIES = '1',               // 2 = una para caja y otra para cocina
+  COPIES = '1',               // copias por impresora
   NOTIFY = 'true',            // notificación de Windows al entrar un pedido
   SOUND_FILE = '',            // opcional: ruta a un .wav para una alerta más fuerte
   SOUND_REPEAT = '2',         // veces que suena el .wav
@@ -124,7 +128,7 @@ function buildTicket(o) {
   return Buffer.from(clean(t), 'latin1');
 }
 
-function print(buf) {
+function printNet(buf) {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection({ host: PRINTER_HOST, port: Number(PRINTER_PORT) }, () => {
       sock.end(buf, resolve);
@@ -133,6 +137,28 @@ function print(buf) {
     sock.on('error', reject);
   });
 }
+
+// USB: Windows no expone el puerto, así que se manda RAW al spooler con usb-print.ps1
+const USB_SCRIPT = fileURLToPath(new URL('./usb-print.ps1', import.meta.url));
+
+async function printUsb(buf) {
+  const file = path.join(os.tmpdir(), `comanda-${process.pid}-${Date.now()}.bin`);
+  await fs.writeFile(file, buf);
+  try {
+    await new Promise((resolve, reject) => {
+      execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', USB_SCRIPT, '-Printer', PRINTER_USB, '-Path', file],
+        { timeout: 20000, windowsHide: true },
+        (e, _out, err) => (e ? reject(new Error((err || e.message).trim().split('\n')[0])) : resolve()));
+    });
+  } finally {
+    await fs.rm(file, { force: true });
+  }
+}
+
+const PRINTERS = [
+  PRINTER_HOST && { name: 'Cocina', target: `${PRINTER_HOST}:${PRINTER_PORT}`, send: printNet },
+  PRINTER_USB && { name: 'Caja', target: `USB "${PRINTER_USB}"`, send: printUsb },
+].filter(Boolean);
 
 // ---------- Notificación en el PC ----------
 const money = (n) => '$' + Number(n).toLocaleString('es-CO', { maximumFractionDigits: 0 });
@@ -144,12 +170,12 @@ function playSound() {
   execFile('powershell', ['-NoProfile', '-Command', ps], (e) => e && console.error('Sonido:', e.message));
 }
 
-function notify(o, printError) {
+function notify(o, failed) {
   if (NOTIFY !== 'true') return;
   const items = o.lineItems.nodes.map((li) => `${li.quantity}x ${li.name}`).join(', ');
   notifier.notify({
     title: `Nuevo pedido ${o.name} - ${money(o.totalPriceSet.shopMoney.amount)}`,
-    message: (printError ? '⚠ NO SE IMPRIMIÓ: revisa la impresora\n' : '') + items.slice(0, 200),
+    message: (failed.length ? `⚠ NO SE IMPRIMIÓ EN: ${failed.join(', ')}\n` : '') + items.slice(0, 200),
     sound: !SOUND_FILE,  // si hay .wav propio, se usa ese en lugar del sonido de Windows
     wait: true,          // queda visible hasta que la cierren
     icon: ICON,
@@ -159,6 +185,7 @@ function notify(o, printError) {
 
 // ---------- Loop ----------
 const notified = new Set(); // evita repetir la alerta si la impresión falla y se reintenta
+const printedOn = new Map(); // pedido -> impresoras donde ya salió, para no duplicar al reintentar
 let running = false;
 async function tick() {
   if (running) return;
@@ -167,23 +194,27 @@ async function tick() {
     const q = `${ORDER_FILTER} -tag:${PRINTED_TAG} -status:cancelled created_at:>='${START}'`;
     const { orders } = await gql(ORDERS_QUERY, { q });
     for (const o of orders.nodes) {
-      let printError = null;
-      try {
-        const ticket = buildTicket(o);
-        for (let i = 0; i < Number(COPIES); i++) await print(ticket);
-      } catch (e) {
-        printError = e;
-      }
+      const ticket = buildTicket(o);
+      const done = printedOn.get(o.id) ?? new Set();
+      printedOn.set(o.id, done);
+      const failed = [];
+      await Promise.all(PRINTERS.filter((p) => !done.has(p.name)).map(async (p) => {
+        try {
+          for (let i = 0; i < Number(COPIES); i++) await p.send(ticket);
+          done.add(p.name);
+        } catch (e) {
+          failed.push(p.name);
+          console.error(new Date().toLocaleTimeString('es-CO'), o.name, `Error impresora ${p.name}:`, e.message);
+        }
+      }));
 
       if (!notified.has(o.id)) {
-        notify(o, printError);
+        notify(o, failed);
         notified.add(o.id);
       }
 
-      if (printError) {
-        console.error(new Date().toLocaleTimeString('es-CO'), o.name, 'Error impresora:', printError.message);
-        continue; // sin tag: se reintenta la impresión en el siguiente ciclo
-      }
+      if (failed.length) continue; // sin tag: se reintenta solo en las impresoras que fallaron
+      printedOn.delete(o.id);
 
       const { tagsAdd } = await gql(TAG_MUTATION, { id: o.id, tags: [PRINTED_TAG] });
       if (tagsAdd.userErrors.length) console.error(o.name, tagsAdd.userErrors);
@@ -196,6 +227,10 @@ async function tick() {
   }
 }
 
-console.log(`Agente de comandas activo -> ${PRINTER_HOST}:${PRINTER_PORT} cada ${POLL_SECONDS}s`);
+if (!PRINTERS.length) {
+  console.error('No hay impresoras configuradas: define PRINTER_HOST y/o PRINTER_USB en .env');
+  process.exit(1);
+}
+console.log(`Agente de comandas activo cada ${POLL_SECONDS}s -> ${PRINTERS.map((p) => `${p.name} (${p.target})`).join(', ')}`);
 tick();
 setInterval(tick, Number(POLL_SECONDS) * 1000);
