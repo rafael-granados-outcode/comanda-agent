@@ -108,6 +108,9 @@ function buildTicket(o) {
   const addr = o.shippingAddress;
   let t = CMD.init + CMD.center + CMD.big(true) + CMD.bold(true);
   t += `COMANDA WEB\n${o.name}\n`;
+  // La mesa (atributo del carrito, viene del QR) va grande arriba para la barra
+  const mesa = o.customAttributes.find((a) => a.key === 'Mesa')?.value;
+  if (mesa) t += (/^[0-9A-Za-z]+$/.test(mesa) ? `MESA ${mesa}` : mesa) + '\n';
   t += CMD.big(false) + CMD.bold(false) + `${hora} - ${o.shippingLine?.title ?? 'Recoger'}\n`;
   t += CMD.left + line + '\n';
 
@@ -122,7 +125,7 @@ function buildTicket(o) {
   t += `Cliente: ${o.customer?.displayName ?? '-'}\n`;
   t += `Tel: ${o.phone ?? addr?.phone ?? '-'}\n`;
   if (addr) t += `Dir: ${[addr.address1, addr.address2, addr.city].filter(Boolean).join(', ')}\n`;
-  for (const a of o.customAttributes) t += `${a.key}: ${a.value}\n`;
+  for (const a of o.customAttributes) if (a.key !== 'Mesa') t += `${a.key}: ${a.value}\n`;
   t += CMD.bold(true) + `TOTAL: $${Number(o.totalPriceSet.shopMoney.amount).toLocaleString('es-CO')}\n` + CMD.bold(false);
   t += CMD.cut;
   return Buffer.from(clean(t), 'latin1');

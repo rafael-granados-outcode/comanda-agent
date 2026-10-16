@@ -12,3 +12,6 @@ tickets/
 npm-debug.log*
 .DS_Store
 Thumbs.db
+
+# QR generados
+qr/salida/
